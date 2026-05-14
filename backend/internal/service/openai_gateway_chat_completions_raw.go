@@ -73,6 +73,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		return nil, fmt.Errorf("missing model in request")
 	}
 	clientStream := gjson.GetBytes(body, "stream").Bool()
+	identityProbe := isOpenAIModelIdentityProbe(body, originalModel)
 
 	// 1b. Extract reasoning effort and service tier from the raw body before any transformation.
 	reasoningEffort := extractOpenAIReasoningEffortFromBody(body, originalModel)
@@ -84,8 +85,20 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 
 	// 3. Rewrite model in body (no protocol conversion)
 	upstreamBody := body
+	if updatedBody, changed, err := injectMaijianPublicOpenAIIntoChatBody(upstreamBody, originalModel); err != nil {
+		return nil, fmt.Errorf("inject public model instructions: %w", err)
+	} else if changed {
+		upstreamBody = updatedBody
+	}
+	if shouldNormalizeOpenAIChatDeveloperRoleForUpstream(account) {
+		if updatedBody, changed, err := normalizeOpenAIChatDeveloperMessages(upstreamBody); err != nil {
+			return nil, fmt.Errorf("normalize chat developer messages: %w", err)
+		} else if changed {
+			upstreamBody = updatedBody
+		}
+	}
 	if upstreamModel != originalModel {
-		upstreamBody = ReplaceModelInBody(body, upstreamModel)
+		upstreamBody = ReplaceModelInBody(upstreamBody, upstreamModel)
 	}
 
 	// 4. Apply OpenAI fast policy on the CC body
@@ -215,14 +228,56 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 				RetryableOnSameAccount: account.IsPoolMode() && (isPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
 			}
 		}
-		return s.handleChatCompletionsErrorResponse(resp, c, account)
+		return s.handleChatCompletionsErrorResponse(resp, c, account, originalModel, upstreamModel)
 	}
 
 	// 8. Forward response
 	if clientStream {
-		return s.streamRawChatCompletions(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+		return s.streamRawChatCompletions(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, identityProbe)
 	}
-	return s.bufferRawChatCompletions(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
+	return s.bufferRawChatCompletions(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime, identityProbe)
+}
+
+func shouldNormalizeOpenAIChatDeveloperRoleForUpstream(account *Account) bool {
+	if account == nil || account.Type != AccountTypeAPIKey {
+		return false
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(account.GetOpenAIBaseURL()))
+	return strings.Contains(baseURL, "dashscope.aliyuncs.com")
+}
+
+func normalizeOpenAIChatDeveloperMessages(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || !gjson.GetBytes(body, "messages").Exists() {
+		return body, false, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(body, &root); err != nil {
+		return body, false, err
+	}
+	messages, ok := root["messages"].([]any)
+	if !ok {
+		return body, false, nil
+	}
+	changed := false
+	for _, item := range messages {
+		msg, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if strings.EqualFold(strings.TrimSpace(role), "developer") {
+			msg["role"] = "system"
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false, nil
+	}
+	nextBody, err := json.Marshal(root)
+	if err != nil {
+		return body, false, err
+	}
+	return nextBody, true, nil
 }
 
 // streamRawChatCompletions 透传上游 CC SSE 流到客户端，并提取 usage（包括
@@ -240,6 +295,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	reasoningEffort *string,
 	serviceTier *string,
 	startTime time.Time,
+	identityProbe bool,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
 
@@ -262,6 +318,7 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	var usage OpenAIUsage
 	var firstTokenMs *int
 	clientDisconnected := false
+	aliasState := &maijianPublicAliasStreamState{identityProbe: identityProbe}
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -279,8 +336,9 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 			}
 		}
 
+		outLine := s.rewriteRawChatCompletionsPublicSSELine(line, upstreamModel, originalModel, aliasState)
 		if !clientDisconnected {
-			if _, werr := c.Writer.WriteString(line + "\n"); werr != nil {
+			if _, werr := c.Writer.WriteString(outLine + "\n"); werr != nil {
 				clientDisconnected = true
 				logger.L().Debug("openai chat_completions raw: client disconnected, continuing to drain upstream for billing",
 					zap.Error(werr),
@@ -371,6 +429,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	reasoningEffort *string,
 	serviceTier *string,
 	startTime time.Time,
+	identityProbe bool,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
 
@@ -393,6 +452,7 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 			usage.CacheReadInputTokens = ccResp.Usage.PromptTokensDetails.CachedTokens
 		}
 	}
+	respBody = s.rewriteRawChatCompletionsPublicBody(respBody, upstreamModel, originalModel, identityProbe)
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)

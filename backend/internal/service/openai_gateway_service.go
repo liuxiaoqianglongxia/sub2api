@@ -2143,6 +2143,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		bodyModified = true
 		markPatchSet("instructions", "You are a helpful coding assistant.")
 	}
+	if !compatMessagesBridge {
+		currentInstructions, _ := reqBody["instructions"].(string)
+		if mergedInstructions, changed := mergeMaijianPublicOpenAIInstructions(currentInstructions, originalModel); changed {
+			reqBody["instructions"] = mergedInstructions
+			bodyModified = true
+			markPatchSet("instructions", mergedInstructions)
+		}
+	}
 
 	if codexImageGenerationBridgeEnabled && ensureOpenAIResponsesImageGenerationTool(reqBody) {
 		bodyModified = true
@@ -2453,6 +2461,12 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				return nil, fmt.Errorf("serialize request body: %w", marshalErr)
 			}
 		}
+	}
+
+	if shouldBridgeOpenAIResponsesAPIKeyToChatCompletions(c, account) {
+		reasoningEffort := extractOpenAIReasoningEffort(reqBody, originalModel)
+		serviceTier := extractOpenAIServiceTier(reqBody)
+		return s.forwardResponsesViaChatCompletions(ctx, c, account, body, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 	}
 
 	// Get access token
@@ -2769,7 +2783,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 					RetryableOnSameAccount: account.IsPoolMode() && (isPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
 				}
 			}
-			return s.handleErrorResponse(ctx, resp, c, account, body)
+			return s.handleErrorResponse(ctx, resp, c, account, body, upstreamModel, originalModel)
 		}
 		defer func() { _ = resp.Body.Close() }()
 
@@ -3924,10 +3938,18 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 	c *gin.Context,
 	account *Account,
 	requestBody []byte,
+	modelAlias ...string,
 ) (*OpenAIForwardResult, error) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	upstreamModel := ""
+	publicModel := ""
+	if len(modelAlias) >= 2 {
+		upstreamModel = modelAlias[0]
+		publicModel = modelAlias[1]
+	}
+	publicBody := rewriteOpenAIPublicAliasBodyText(body, upstreamModel, publicModel)
 
-	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(body))
+	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(publicBody))
 	upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
 	upstreamDetail := ""
 	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
@@ -3935,10 +3957,10 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		if maxBytes <= 0 {
 			maxBytes = 2048
 		}
-		upstreamDetail = truncateString(string(body), maxBytes)
+		upstreamDetail = truncateString(string(publicBody), maxBytes)
 	}
 	setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, upstreamDetail)
-	logOpenAIInstructionsRequiredDebug(ctx, c, account, resp.StatusCode, upstreamMsg, requestBody, body)
+	logOpenAIInstructionsRequiredDebug(ctx, c, account, resp.StatusCode, upstreamMsg, requestBody, publicBody)
 
 	if s.cfg != nil && s.cfg.Gateway.LogUpstreamErrorBody {
 		logger.LegacyPrintf("service.openai_gateway",
@@ -3955,11 +3977,12 @@ func (s *OpenAIGatewayService) handleErrorResponse(
 		c,
 		PlatformOpenAI,
 		resp.StatusCode,
-		body,
+		publicBody,
 		http.StatusBadGateway,
 		"upstream_error",
 		"Upstream request failed",
 	); matched {
+		errMsg = rewriteOpenAIPublicAliasText(errMsg, upstreamModel, publicModel)
 		c.JSON(status, gin.H{
 			"error": gin.H{
 				"type":    errType,
@@ -4081,9 +4104,21 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 	account *Account,
 	writeError compatErrorWriter,
 ) (*OpenAIForwardResult, error) {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	return s.handleCompatErrorResponseWithModelAlias(resp, c, account, writeError, "", "")
+}
 
-	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(body))
+func (s *OpenAIGatewayService) handleCompatErrorResponseWithModelAlias(
+	resp *http.Response,
+	c *gin.Context,
+	account *Account,
+	writeError compatErrorWriter,
+	upstreamModel string,
+	publicModel string,
+) (*OpenAIForwardResult, error) {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	publicBody := rewriteOpenAIPublicAliasBodyText(body, upstreamModel, publicModel)
+
+	upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(publicBody))
 	if upstreamMsg == "" {
 		upstreamMsg = fmt.Sprintf("Upstream error: %d", resp.StatusCode)
 	}
@@ -4095,15 +4130,16 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 		if maxBytes <= 0 {
 			maxBytes = 2048
 		}
-		upstreamDetail = truncateString(string(body), maxBytes)
+		upstreamDetail = truncateString(string(publicBody), maxBytes)
 	}
 	setOpsUpstreamError(c, resp.StatusCode, upstreamMsg, upstreamDetail)
 
 	// Apply error passthrough rules
 	if status, errType, errMsg, matched := applyErrorPassthroughRule(
-		c, account.Platform, resp.StatusCode, body,
+		c, account.Platform, resp.StatusCode, publicBody,
 		http.StatusBadGateway, "api_error", "Upstream request failed",
 	); matched {
+		errMsg = rewriteOpenAIPublicAliasText(errMsg, upstreamModel, publicModel)
 		writeError(c, status, errType, errMsg)
 		if upstreamMsg == "" {
 			upstreamMsg = errMsg

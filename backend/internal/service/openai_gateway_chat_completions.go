@@ -77,6 +77,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	originalModel := chatReq.Model
 	clientStream := chatReq.Stream
 	includeUsage := chatReq.StreamOptions != nil && chatReq.StreamOptions.IncludeUsage
+	identityProbe := isOpenAIModelIdentityProbe(body, originalModel)
 
 	// 2. Resolve model mapping early so compat prompt_cache_key injection can
 	// derive a stable seed from the final upstream model family.
@@ -128,6 +129,11 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		if err != nil {
 			return nil, fmt.Errorf("normalize service_tier in responses-shape body: %w", err)
 		}
+		if updatedBody, changed, injectErr := injectMaijianPublicOpenAIIntoResponsesBody(responsesBody, originalModel); injectErr != nil {
+			return nil, fmt.Errorf("inject public model instructions: %w", injectErr)
+		} else if changed {
+			responsesBody = updatedBody
+		}
 		// Minimal stub populated from the raw body so downstream billing
 		// propagation (ServiceTier, ReasoningEffort) keeps working.
 		responsesReq = &apicompat.ResponsesRequest{
@@ -145,6 +151,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 			return nil, fmt.Errorf("convert chat completions to responses: %w", err)
 		}
 		responsesReq.Model = upstreamModel
+		_ = applyMaijianPublicOpenAIToResponsesRequest(responsesReq, originalModel)
 		normalizeResponsesRequestServiceTier(responsesReq)
 		responsesBody, err = json.Marshal(responsesReq)
 		if err != nil {
@@ -275,16 +282,16 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 				RetryableOnSameAccount: account.IsPoolMode() && (isPoolModeRetryableStatus(resp.StatusCode) || isOpenAITransientProcessingError(resp.StatusCode, upstreamMsg, respBody)),
 			}
 		}
-		return s.handleChatCompletionsErrorResponse(resp, c, account)
+		return s.handleChatCompletionsErrorResponse(resp, c, account, originalModel, upstreamModel)
 	}
 
 	// 9. Handle normal response
 	var result *OpenAIForwardResult
 	var handleErr error
 	if clientStream {
-		result, handleErr = s.handleChatStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, includeUsage, startTime)
+		result, handleErr = s.handleChatStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, includeUsage, startTime, identityProbe)
 	} else {
-		result, handleErr = s.handleChatBufferedStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, startTime)
+		result, handleErr = s.handleChatBufferedStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, startTime, identityProbe)
 	}
 
 	// Propagate ServiceTier and ReasoningEffort to result for billing
@@ -350,8 +357,10 @@ func (s *OpenAIGatewayService) handleChatCompletionsErrorResponse(
 	resp *http.Response,
 	c *gin.Context,
 	account *Account,
+	originalModel string,
+	upstreamModel string,
 ) (*OpenAIForwardResult, error) {
-	return s.handleCompatErrorResponse(resp, c, account, writeChatCompletionsError)
+	return s.handleCompatErrorResponseWithModelAlias(resp, c, account, writeChatCompletionsError, upstreamModel, originalModel)
 }
 
 // handleChatBufferedStreamingResponse reads all Responses SSE events from the
@@ -364,6 +373,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 	billingModel string,
 	upstreamModel string,
 	startTime time.Time,
+	identityProbe bool,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
 
@@ -382,6 +392,7 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 	acc.SupplementResponseOutput(finalResponse)
 
 	chatResp := apicompat.ResponsesToChatCompletions(finalResponse, originalModel)
+	applyMaijianPublicAliasToChatResponse(chatResp, upstreamModel, originalModel, identityProbe)
 
 	if s.responseHeaderFilter != nil {
 		responseheaders.WriteFilteredHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
@@ -409,6 +420,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	upstreamModel string,
 	includeUsage bool,
 	startTime time.Time,
+	identityProbe bool,
 ) (*OpenAIForwardResult, error) {
 	requestID := resp.Header.Get("x-request-id")
 
@@ -424,6 +436,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	state := apicompat.NewResponsesEventToChatState()
 	state.Model = originalModel
 	state.IncludeUsage = includeUsage
+	aliasState := &maijianPublicAliasStreamState{identityProbe: identityProbe}
 
 	var usage OpenAIUsage
 	var firstTokenMs *int
@@ -489,6 +502,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 		chunks := apicompat.ResponsesEventToChatChunks(&event, state)
 		if !clientDisconnected {
 			for _, chunk := range chunks {
+				applyMaijianPublicAliasToChatChunk(&chunk, upstreamModel, originalModel, aliasState)
 				sse, err := apicompat.ChatChunkToSSE(chunk)
 				if err != nil {
 					logger.L().Warn("openai chat_completions stream: failed to marshal chunk",
@@ -515,6 +529,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	finalizeStream := func() (*OpenAIForwardResult, error) {
 		if finalChunks := apicompat.FinalizeResponsesChatStream(state); len(finalChunks) > 0 && !clientDisconnected {
 			for _, chunk := range finalChunks {
+				applyMaijianPublicAliasToChatChunk(&chunk, upstreamModel, originalModel, aliasState)
 				sse, err := apicompat.ChatChunkToSSE(chunk)
 				if err != nil {
 					continue

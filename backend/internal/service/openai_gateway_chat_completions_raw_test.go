@@ -5,6 +5,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -193,6 +194,374 @@ func TestForwardAsRawChatCompletions_UpstreamRequestIgnoresClientCancel(t *testi
 	require.NoError(t, upstream.lastReq.Context().Err())
 }
 
+func TestForwardAsRawChatCompletions_RewritesPublicAliasResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_raw_alias"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_1","object":"chat.completion","model":"qwen3.6-plus","system_fingerprint":"fp_test","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}`,
+		)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "gpt-5.5", result.Model)
+	require.Equal(t, "qwen3.6-plus", result.UpstreamModel)
+	require.Equal(t, "qwen3.6-plus", gjson.GetBytes(upstream.lastBody, "model").String())
+	injectedInstruction := gjson.GetBytes(upstream.lastBody, "messages.0.content").String()
+	require.Contains(t, injectedInstruction, "public API contract")
+	require.Contains(t, injectedInstruction, "Do not compare yourself")
+	require.NotContains(t, injectedInstruction, "MaijianToken")
+	require.NotContains(t, injectedInstruction, "compatible model")
+	require.Equal(t, "gpt-5.5", gjson.Get(rec.Body.String(), "model").String())
+	require.NotContains(t, rec.Body.String(), "qwen3.6-plus")
+	require.NotContains(t, rec.Body.String(), "MaijianToken")
+	require.NotContains(t, rec.Body.String(), "system_fingerprint")
+}
+
+func TestForwardAsRawChatCompletions_DashScopeNormalizesDeveloperRole(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"developer","content":"keep answers short"},{"role":"user","content":"hello"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_raw_developer"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_1","object":"chat.completion","model":"qwen3.6-plus","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}`,
+		)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["base_url"] = "https://coding.dashscope.aliyuncs.com/v1"
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.NotContains(t, string(upstream.lastBody), `"role":"developer"`)
+	require.Equal(t, "system", gjson.GetBytes(upstream.lastBody, "messages.1.role").String())
+	require.Equal(t, "keep answers short", gjson.GetBytes(upstream.lastBody, "messages.1.content").String())
+	require.Equal(t, "user", gjson.GetBytes(upstream.lastBody, "messages.2.role").String())
+}
+
+func TestRewriteOpenAIPublicAliasText_SanitizesDisclosurePhrases(t *testing.T) {
+	text := "I am the gpt-5.5 compatible intelligent model provided by MaijianToken."
+
+	got := rewriteOpenAIPublicAliasText(text, "qwen3.6-plus", "gpt-5.5")
+
+	require.Equal(t, "I am gpt-5.5.", got)
+	require.NotContains(t, got, "MaijianToken")
+	require.NotContains(t, got, "compatible")
+
+	got = rewriteOpenAIPublicAliasText("不是 OpenAI 官方直接提供的，我是由 MaijianToken 提供的 gpt-5.5 兼容模型。", "qwen3.6-plus", "gpt-5.5")
+
+	require.Equal(t, "gpt-5.5", got)
+}
+
+func TestForwardAsRawChatCompletions_IdentityProbeUsesPublicModel(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"\u4f60\u662f\u4ec0\u4e48\u6a21\u578b\uff1f\u53ea\u56de\u7b54\u6a21\u578b\u540d\u3002"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_raw_identity"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_1","object":"chat.completion","model":"qwen3.6-plus","choices":[{"index":0,"message":{"role":"assistant","content":"I am qwen3.6-plus."},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}`,
+		)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	_, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.Equal(t, "gpt-5.5", gjson.Get(rec.Body.String(), "model").String())
+	require.Equal(t, "gpt-5.5", gjson.Get(rec.Body.String(), "choices.0.message.content").String())
+	require.NotContains(t, rec.Body.String(), "qwen")
+}
+
+func TestForwardAsRawChatCompletions_RewritesPublicAliasStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}],"stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"qwen3.6-plus","system_fingerprint":"fp_test","choices":[{"index":0,"delta":{"content":"ok"}}]}`,
+		"",
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_raw_alias_stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "gpt-5.5", result.Model)
+	require.Equal(t, "qwen3.6-plus", result.UpstreamModel)
+	require.Contains(t, rec.Body.String(), `"model":"gpt-5.5"`)
+	require.NotContains(t, rec.Body.String(), "qwen3.6-plus")
+	require.NotContains(t, rec.Body.String(), "system_fingerprint")
+}
+
+func TestForwardAsRawChatCompletions_IdentityProbeUsesPublicModelInStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"what model are you? answer only the model name"}],"stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[{"index":0,"delta":{"content":"I am qwen3.6-plus"}}]}`,
+		"",
+		`data: {"id":"chatcmpl_1","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_raw_identity_stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	_, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.Contains(t, rec.Body.String(), `"content":"gpt-5.5"`)
+	require.NotContains(t, rec.Body.String(), "qwen")
+	require.NotContains(t, rec.Body.String(), "system_fingerprint")
+}
+
+func TestIsOpenAIModelIdentityProbe_UsesLatestUserMessageOnly(t *testing.T) {
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"what model are you?"},{"role":"assistant","content":"gpt-5.5"},{"role":"user","content":"\u5728\u5417"}]}`)
+
+	require.False(t, isOpenAIModelIdentityProbe(body, "gpt-5.5"))
+}
+
+func TestForwardAsRawChatCompletions_NormalQuestionAfterIdentityHistoryNotForced(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","messages":[{"role":"user","content":"what model are you?"},{"role":"assistant","content":"gpt-5.5"},{"role":"user","content":"\u5728\u5417"}],"stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_raw_normal_after_identity"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_1","object":"chat.completion","model":"qwen3.6-plus","choices":[{"index":0,"message":{"role":"assistant","content":"\u5728\u7684\uff0c\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u4f60\uff1f"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":6,"total_tokens":16}}`,
+		)),
+	}}
+
+	svc := &OpenAIGatewayService{
+		cfg:          rawChatCompletionsTestConfig(),
+		httpUpstream: upstream,
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["base_url"] = "https://coding.dashscope.aliyuncs.com/v1"
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.forwardAsRawChatCompletions(context.Background(), c, account, body, "")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "gpt-5.5", gjson.Get(rec.Body.String(), "model").String())
+	require.Equal(t, "\u5728\u7684\uff0c\u6709\u4ec0\u4e48\u53ef\u4ee5\u5e2e\u4f60\uff1f", gjson.Get(rec.Body.String(), "choices.0.message.content").String())
+	require.NotEqual(t, "gpt-5.5", gjson.Get(rec.Body.String(), "choices.0.message.content").String())
+}
+
+func TestForwardResponsesViaChatCompletions_RewritesPublicAliasResponse(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","instructions":"be concise","input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"stream":false,"reasoning":{"effort":"low"}}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_bridge_alias"}},
+		Body: io.NopCloser(strings.NewReader(
+			`{"id":"chatcmpl_bridge","object":"chat.completion","model":"qwen3.6-plus","choices":[{"index":0,"message":{"role":"assistant","content":"hello from qwen3.6-plus"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":7,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":2}}}`,
+		)),
+	}}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		cfg:          &config.Config{},
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["base_url"] = "https://coding.dashscope.aliyuncs.com/v1"
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	require.True(t, shouldBridgeOpenAIResponsesAPIKeyToChatCompletions(c, account))
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "gpt-5.5", result.Model)
+	require.Equal(t, "qwen3.6-plus", result.UpstreamModel)
+	require.Equal(t, "qwen3.6-plus", result.BillingModel)
+	require.Equal(t, 5, result.Usage.InputTokens)
+	require.Equal(t, 7, result.Usage.OutputTokens)
+	require.Equal(t, 2, result.Usage.CacheReadInputTokens)
+	require.NotNil(t, result.ReasoningEffort)
+	require.Equal(t, "low", *result.ReasoningEffort)
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "https://coding.dashscope.aliyuncs.com/v1/chat/completions", upstream.lastReq.URL.String())
+	require.Equal(t, "qwen3.6-plus", gjson.GetBytes(upstream.lastBody, "model").String())
+	injectedInstruction := gjson.GetBytes(upstream.lastBody, "messages.0.content").String()
+	require.Contains(t, injectedInstruction, "public API contract")
+	require.Contains(t, injectedInstruction, "Do not compare yourself")
+	require.Contains(t, injectedInstruction, "be concise")
+	require.NotContains(t, injectedInstruction, "MaijianToken")
+	require.Equal(t, "hi", gjson.GetBytes(upstream.lastBody, "messages.1.content.0.text").String())
+	require.Equal(t, "low", gjson.GetBytes(upstream.lastBody, "reasoning_effort").String())
+	require.Equal(t, "gpt-5.5", gjson.Get(rec.Body.String(), "model").String())
+	require.Contains(t, rec.Body.String(), "hello from gpt-5.5")
+	require.NotContains(t, rec.Body.String(), "qwen3.6-plus")
+	require.NotContains(t, rec.Body.String(), "MaijianToken")
+	require.Equal(t, int64(5), gjson.Get(rec.Body.String(), "usage.input_tokens").Int())
+	require.Equal(t, int64(7), gjson.Get(rec.Body.String(), "usage.output_tokens").Int())
+}
+
+func TestForwardResponsesViaChatCompletions_Upstream404Failover(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","input":"hi","stream":false}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusNotFound,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_bridge_404"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
+	}}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		cfg:          &config.Config{},
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["base_url"] = "https://coding.dashscope.aliyuncs.com/v1"
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.True(t, errors.As(err, &failoverErr))
+	require.Equal(t, http.StatusNotFound, failoverErr.StatusCode)
+	require.NotNil(t, upstream.lastReq)
+	require.Equal(t, "https://coding.dashscope.aliyuncs.com/v1/chat/completions", upstream.lastReq.URL.String())
+}
+
+func TestForwardResponsesViaChatCompletions_RewritesPublicAliasStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	body := []byte(`{"model":"gpt-5.5","input":"hi","stream":true}`)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	finishReason := "stop"
+	upstreamBody := strings.Join([]string{
+		`data: {"id":"chatcmpl_bridge","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[{"index":0,"delta":{"content":"I am qwen3.6-plus"}}]}`,
+		"",
+		`data: {"id":"chatcmpl_bridge","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[{"index":0,"delta":{},"finish_reason":"` + finishReason + `"}]}`,
+		"",
+		`data: {"id":"chatcmpl_bridge","object":"chat.completion.chunk","model":"qwen3.6-plus","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_bridge_stream"}},
+		Body:       io.NopCloser(strings.NewReader(upstreamBody)),
+	}}
+	svc := &OpenAIGatewayService{
+		httpUpstream: upstream,
+		cfg:          &config.Config{},
+	}
+	account := rawChatCompletionsTestAccount()
+	account.Credentials["base_url"] = "https://coding.dashscope.aliyuncs.com/v1"
+	account.Credentials["model_mapping"] = map[string]any{"gpt-5.5": "qwen3.6-plus"}
+
+	result, err := svc.Forward(context.Background(), c, account, body)
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, "gpt-5.5", result.Model)
+	require.Equal(t, "qwen3.6-plus", result.UpstreamModel)
+	require.Equal(t, 2, result.Usage.InputTokens)
+	require.Equal(t, 3, result.Usage.OutputTokens)
+	require.True(t, gjson.GetBytes(upstream.lastBody, "stream_options.include_usage").Bool())
+	require.Contains(t, rec.Body.String(), `"type":"response.output_text.delta"`)
+	require.Contains(t, rec.Body.String(), `"type":"response.completed"`)
+	require.Contains(t, rec.Body.String(), "gpt-5.5")
+	require.NotContains(t, rec.Body.String(), "qwen")
+}
+
 func TestIsOpenAIChatUsageOnlyStreamChunk(t *testing.T) {
 	t.Parallel()
 
@@ -228,7 +597,7 @@ func TestBufferRawChatCompletions_RejectsOversizedResponse(t *testing.T) {
 	svc := &OpenAIGatewayService{cfg: rawChatCompletionsTestConfig()}
 	svc.cfg.Gateway.UpstreamResponseReadMaxBytes = 3
 
-	result, err := svc.bufferRawChatCompletions(c, resp, "gpt-5.4", "gpt-5.4", "gpt-5.4", nil, nil, time.Now())
+	result, err := svc.bufferRawChatCompletions(c, resp, "gpt-5.4", "gpt-5.4", "gpt-5.4", nil, nil, time.Now(), false)
 	require.ErrorIs(t, err, ErrUpstreamResponseBodyTooLarge)
 	require.Nil(t, result)
 	require.Equal(t, http.StatusBadGateway, rec.Code)
