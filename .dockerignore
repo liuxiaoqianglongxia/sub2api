@@ -29,9 +29,12 @@ build/
 # Node modules (will be installed in container)
 frontend/node_modules/
 node_modules/
+.pnpm-store/
+frontend/.pnpm-store/
 
 # Go build cache (will be built in container)
 backend/vendor/
+backend/sub2api*
 
 # Test files
 *_test.go

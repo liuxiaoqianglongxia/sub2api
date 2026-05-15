@@ -20,8 +20,9 @@ FROM ${NODE_IMAGE} AS frontend-builder
 
 WORKDIR /app/frontend
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Install pnpm. Pin the version so Docker builds do not break when pnpm
+# changes default build-script policies upstream.
+RUN corepack enable && corepack prepare pnpm@10.23.0 --activate && pnpm config set dangerouslyAllowAllBuilds true
 
 # Install dependencies first (better caching)
 COPY frontend/package.json frontend/pnpm-lock.yaml ./

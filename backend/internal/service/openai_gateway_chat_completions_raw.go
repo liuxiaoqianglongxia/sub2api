@@ -225,6 +225,24 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	return s.bufferRawChatCompletions(c, resp, originalModel, billingModel, upstreamModel, reasoningEffort, serviceTier, startTime)
 }
 
+func applyDashScopeChatThinkingDefault(body []byte, account *Account) ([]byte, bool, error) {
+	if account == nil || account.Type != AccountTypeAPIKey || len(body) == 0 {
+		return body, false, nil
+	}
+	baseURL := strings.ToLower(strings.TrimSpace(account.GetOpenAIBaseURL()))
+	if !strings.Contains(baseURL, "dashscope.aliyuncs.com") {
+		return body, false, nil
+	}
+	if gjson.GetBytes(body, "enable_thinking").Exists() {
+		return body, false, nil
+	}
+	nextBody, err := sjson.SetBytes(body, "enable_thinking", false)
+	if err != nil {
+		return body, false, err
+	}
+	return nextBody, true, nil
+}
+
 // streamRawChatCompletions 透传上游 CC SSE 流到客户端，并提取 usage（包括
 // 末尾 [DONE] 之前的 chunk 中的 usage 字段，按 OpenAI CC 协议）。
 //
