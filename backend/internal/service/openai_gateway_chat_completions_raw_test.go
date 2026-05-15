@@ -27,17 +27,17 @@ func TestBuildOpenAIChatCompletionsURL(t *testing.T) {
 		base string
 		want string
 	}{
-		// 已是 /chat/completions：原样返回
+		// ?? /chat/completions?????
 		{"already chat/completions", "https://api.openai.com/v1/chat/completions", "https://api.openai.com/v1/chat/completions"},
-		// 以 /v1 结尾：追加 /chat/completions
+		// ? /v1 ????? /chat/completions
 		{"bare /v1", "https://api.openai.com/v1", "https://api.openai.com/v1/chat/completions"},
-		// 其他情况：追加 /v1/chat/completions
+		// ??????? /v1/chat/completions
 		{"bare domain", "https://api.openai.com", "https://api.openai.com/v1/chat/completions"},
 		{"domain with trailing slash", "https://api.openai.com/", "https://api.openai.com/v1/chat/completions"},
-		// 第三方上游常见形式
+		// ?????????
 		{"third-party bare domain", "https://api.deepseek.com", "https://api.deepseek.com/v1/chat/completions"},
 		{"third-party with path prefix", "https://api.gptgod.online/api", "https://api.gptgod.online/api/v1/chat/completions"},
-		// 带空白字符
+		// ?????
 		{"whitespace trimmed", "  https://api.openai.com/v1  ", "https://api.openai.com/v1/chat/completions"},
 	}
 
@@ -50,8 +50,8 @@ func TestBuildOpenAIChatCompletionsURL(t *testing.T) {
 	}
 }
 
-// TestBuildOpenAIResponsesURL_ProbeURL 锁定 probe/测试端点使用的 URL 构建逻辑，
-// 确保 buildOpenAIResponsesURL 对标准 OpenAI base_url 格式均拼出 `/v1/responses`。
+// TestBuildOpenAIResponsesURL_ProbeURL ?? probe/??????? URL ?????
+// ?? buildOpenAIResponsesURL ??? OpenAI base_url ????? `/v1/responses`?
 func TestBuildOpenAIResponsesURL_ProbeURL(t *testing.T) {
 	t.Parallel()
 
@@ -117,6 +117,27 @@ func TestForwardAsRawChatCompletions_ForcesStreamUsageUpstreamAndPassesUsageDown
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream_options.include_usage").Bool())
 	require.Contains(t, rec.Body.String(), `"usage"`)
 	require.Contains(t, rec.Body.String(), "data: [DONE]")
+}
+
+func TestApplyOpenAIChatCompletionsDefaultEnableThinking(t *testing.T) {
+	t.Parallel()
+
+	account := rawChatCompletionsTestAccount()
+	account.Extra = map[string]any{
+		openAIChatCompletionsDefaultEnableThinkingExtraKey: false,
+	}
+
+	body := []byte(`{"model":"qwen3.6-plus","messages":[{"role":"user","content":"hi"}]}`)
+	got, changed, err := applyOpenAIChatCompletionsDefaultEnableThinking(account, body)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, gjson.GetBytes(got, "enable_thinking").Bool())
+
+	bodyWithExplicitValue := []byte(`{"model":"qwen3.6-plus","enable_thinking":true,"messages":[{"role":"user","content":"hi"}]}`)
+	got, changed, err = applyOpenAIChatCompletionsDefaultEnableThinking(account, bodyWithExplicitValue)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.True(t, gjson.GetBytes(got, "enable_thinking").Bool())
 }
 
 func TestForwardAsRawChatCompletions_ClientDisconnectDrainsUsage(t *testing.T) {
@@ -278,7 +299,7 @@ func TestRewriteOpenAIPublicAliasText_SanitizesDisclosurePhrases(t *testing.T) {
 	require.NotContains(t, got, "MaijianToken")
 	require.NotContains(t, got, "compatible")
 
-	got = rewriteOpenAIPublicAliasText("不是 OpenAI 官方直接提供的，我是由 MaijianToken 提供的 gpt-5.5 兼容模型。", "qwen3.6-plus", "gpt-5.5")
+	got = rewriteOpenAIPublicAliasText("?? OpenAI ??????????? MaijianToken ??? gpt-5.5 ?????", "qwen3.6-plus", "gpt-5.5")
 
 	require.Equal(t, "gpt-5.5", got)
 }

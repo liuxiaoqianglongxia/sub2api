@@ -21,42 +21,44 @@ import (
 	"go.uber.org/zap"
 )
 
-// openaiCCRawAllowedHeaders 是 CC 直转路径专用的客户端 header 透传白名单。
+// openaiCCRawAllowedHeaders ? CC ?????????? header ??????
 //
-// **关键**：不能复用 openaiAllowedHeaders——后者含 Codex 客户端专属 header
-// （originator / session_id / x-codex-turn-state / x-codex-turn-metadata / conversation_id），
-// 这些在 ChatGPT OAuth 上游是必需的，但透传给 DeepSeek/Kimi/GLM 等第三方
-// OpenAI 兼容上游会造成：
-//   - 完全忽略（多数友好厂商）——隐性污染上游统计
-//   - 400 "unknown parameter"（严格上游）——可见错误
+// **??**????? openaiAllowedHeaders????? Codex ????? header
+// ?originator / session_id / x-codex-turn-state / x-codex-turn-metadata / conversation_id??
+// ??? ChatGPT OAuth ??????????? DeepSeek/Kimi/GLM ????
+// OpenAI ????????
+//   - ??????????????????????
+//   - 400 "unknown parameter"????????????
 //
-// 这里仅放行通用 HTTP header；content-type / authorization / accept 由上下文
-// 显式设置，不依赖透传。
+// ??????? HTTP header?content-type / authorization / accept ????
+// ???????????
 //
-// 参见决策记录：
+// ???????
 // pensieve/short-term/maxims/dont-reuse-shared-headers-whitelist-across-different-upstream-trust-domains
 var openaiCCRawAllowedHeaders = map[string]bool{
 	"accept-language": true,
 	"user-agent":      true,
 }
 
-// forwardAsRawChatCompletions 直转客户端的 Chat Completions 请求到上游
-// `{base_url}/v1/chat/completions`，**不**做 CC↔Responses 协议转换。
+const openAIChatCompletionsDefaultEnableThinkingExtraKey = "openai_chat_completions_default_enable_thinking"
+
+// forwardAsRawChatCompletions ?????? Chat Completions ?????
+// `{base_url}/v1/chat/completions`?**?**? CC?Responses ?????
 //
-// 适用场景：account.platform=openai && account.type=apikey && 上游已被探测确认
-// 不支持 /v1/responses 端点（如 DeepSeek/Kimi/GLM/Qwen 等第三方 OpenAI 兼容上游）。
+// ?????account.platform=openai && account.type=apikey && ????????
+// ??? /v1/responses ???? DeepSeek/Kimi/GLM/Qwen ???? OpenAI ??????
 //
-// 与 ForwardAsChatCompletions 的关键差异：
+// ? ForwardAsChatCompletions ??????
 //
-//   - 不调用 apicompat.ChatCompletionsToResponses，body 仅做模型 ID 改写
-//   - 上游 URL 拼到 /v1/chat/completions 而非 /v1/responses
-//   - 流式响应 SSE 直接透传给客户端（上游 chunk 已是 CC 格式）
-//   - 非流式响应 JSON 直接透传，仅按需提取 usage
-//   - 不应用 codex OAuth transform（APIKey 路径无 OAuth）
-//   - 不注入 prompt_cache_key（OAuth 专属机制）
+//   - ??? apicompat.ChatCompletionsToResponses?body ???? ID ??
+//   - ?? URL ?? /v1/chat/completions ?? /v1/responses
+//   - ???? SSE ??????????? chunk ?? CC ???
+//   - ????? JSON ?????????? usage
+//   - ??? codex OAuth transform?APIKey ??? OAuth?
+//   - ??? prompt_cache_key?OAuth ?????
 //
-// 调用入口：openai_gateway_chat_completions.go::ForwardAsChatCompletions
-// 在函数顶部按 openai_compat.ShouldUseResponsesAPI 分流。
+// ?????openai_gateway_chat_completions.go::ForwardAsChatCompletions
+// ?????? openai_compat.ShouldUseResponsesAPI ???
 func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 	ctx context.Context,
 	c *gin.Context,
@@ -96,6 +98,11 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		} else if changed {
 			upstreamBody = updatedBody
 		}
+	}
+	if updatedBody, changed, err := applyOpenAIChatCompletionsDefaultEnableThinking(account, upstreamBody); err != nil {
+		return nil, fmt.Errorf("apply chat completions default enable_thinking: %w", err)
+	} else if changed {
+		upstreamBody = updatedBody
 	}
 	if upstreamModel != originalModel {
 		upstreamBody = ReplaceModelInBody(upstreamBody, upstreamModel)
@@ -156,7 +163,7 @@ func (s *OpenAIGatewayService) forwardAsRawChatCompletions(
 		upstreamReq.Header.Set("Accept", "application/json")
 	}
 
-	// 透传白名单中的客户端 header。详见 openaiCCRawAllowedHeaders 的设计说明。
+	// ?????????? header??? openaiCCRawAllowedHeaders ??????
 	for key, values := range c.Request.Header {
 		lowerKey := strings.ToLower(key)
 		if openaiCCRawAllowedHeaders[lowerKey] {
@@ -280,12 +287,12 @@ func normalizeOpenAIChatDeveloperMessages(body []byte) ([]byte, bool, error) {
 	return nextBody, true, nil
 }
 
-// streamRawChatCompletions 透传上游 CC SSE 流到客户端，并提取 usage（包括
-// 末尾 [DONE] 之前的 chunk 中的 usage 字段，按 OpenAI CC 协议）。
+// streamRawChatCompletions ???? CC SSE ????????? usage???
+// ?? [DONE] ??? chunk ?? usage ???? OpenAI CC ????
 //
-// usage 字段仅在客户端请求 stream_options.include_usage=true 时出现于上游响应中。
-// 网关会对上游强制打开 include_usage 以保证计费完整，并原样向下游透传 usage，
-// 让级联代理或下游计费系统也能拿到完整用量。
+// usage ????????? stream_options.include_usage=true ??????????
+// ?????????? include_usage ???????????????? usage?
+// ?????????????????????
 func (s *OpenAIGatewayService) streamRawChatCompletions(
 	c *gin.Context,
 	resp *http.Response,
@@ -380,14 +387,36 @@ func (s *OpenAIGatewayService) streamRawChatCompletions(
 	}, nil
 }
 
-// ensureOpenAIChatStreamUsage 确保 raw Chat Completions 流式请求会让上游返回 usage。
-// usage 也会继续向下游透传，支持级联代理和下游计费系统。
+// ensureOpenAIChatStreamUsage ?? raw Chat Completions ?????????? usage?
+// usage ????????????????????????
 func ensureOpenAIChatStreamUsage(body []byte) ([]byte, error) {
 	updated, err := sjson.SetBytes(body, "stream_options.include_usage", true)
 	if err != nil {
 		return body, err
 	}
 	return updated, nil
+}
+
+func applyOpenAIChatCompletionsDefaultEnableThinking(account *Account, body []byte) ([]byte, bool, error) {
+	if account == nil || account.Extra == nil {
+		return body, false, nil
+	}
+	rawDefault, exists := account.Extra[openAIChatCompletionsDefaultEnableThinkingExtraKey]
+	if !exists {
+		return body, false, nil
+	}
+	defaultEnableThinking, ok := rawDefault.(bool)
+	if !ok {
+		return body, false, nil
+	}
+	if gjson.GetBytes(body, "enable_thinking").Exists() {
+		return body, false, nil
+	}
+	updated, err := sjson.SetBytes(body, "enable_thinking", defaultEnableThinking)
+	if err != nil {
+		return body, false, err
+	}
+	return updated, true, nil
 }
 
 func isOpenAIChatUsageOnlyStreamChunk(payload string) bool {
@@ -401,9 +430,9 @@ func isOpenAIChatUsageOnlyStreamChunk(payload string) bool {
 	return choices.Exists() && choices.IsArray() && len(choices.Array()) == 0
 }
 
-// extractCCStreamUsage 从单个 CC 流式 chunk 的 payload 中提取 usage 字段。
-// CC 协议中 usage 仅出现在末尾 chunk（且仅当 include_usage 生效时），
-// 但上游可能在多个 chunk 中重复——总是用最新值。
+// extractCCStreamUsage ??? CC ?? chunk ? payload ??? usage ???
+// CC ??? usage ?????? chunk???? include_usage ?????
+// ???????? chunk ????????????
 func extractCCStreamUsage(payload string) *OpenAIUsage {
 	usageResult := gjson.Get(payload, "usage")
 	if !usageResult.Exists() || !usageResult.IsObject() {
@@ -419,7 +448,7 @@ func extractCCStreamUsage(payload string) *OpenAIUsage {
 	return &u
 }
 
-// bufferRawChatCompletions 透传上游 CC 非流式 JSON 响应。
+// bufferRawChatCompletions ???? CC ??? JSON ???
 func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	c *gin.Context,
 	resp *http.Response,
@@ -478,13 +507,13 @@ func (s *OpenAIGatewayService) bufferRawChatCompletions(
 	}, nil
 }
 
-// buildOpenAIChatCompletionsURL 拼接上游 Chat Completions 端点 URL。
+// buildOpenAIChatCompletionsURL ???? Chat Completions ?? URL?
 //
-//   - base 已是 /chat/completions：原样返回
-//   - base 以 /v1 结尾：追加 /chat/completions
-//   - 其他情况：追加 /v1/chat/completions
+//   - base ?? /chat/completions?????
+//   - base ? /v1 ????? /chat/completions
+//   - ??????? /v1/chat/completions
 //
-// 与 buildOpenAIResponsesURL 是姐妹函数。
+// ? buildOpenAIResponsesURL ??????
 func buildOpenAIChatCompletionsURL(base string) string {
 	normalized := strings.TrimRight(strings.TrimSpace(base), "/")
 	if strings.HasSuffix(normalized, "/chat/completions") {
